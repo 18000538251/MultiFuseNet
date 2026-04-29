@@ -15,8 +15,8 @@ seed_value = 42
 np.random.seed(seed_value)
 random.seed(seed_value)
 
-x,y = np.load('D:\x_data.npy',allow_pickle=True),\
-      np.load('D:\y_data.npy',allow_pickle=True)
+x,y = np.load('D:\x_data.npy',allow_pickle=True),\  #x:(N,31,31)
+      np.load('D:\y_data.npy',allow_pickle=True)    #y:(N,8,8)
 train_x,train_y = x, y
 
 in_fea_num = train_x.shape[2]
