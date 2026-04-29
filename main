@@ -7,8 +7,10 @@ from keras.layers import Dense,Input,Conv1D,Softmax,Dot
 from keras.callbacks import ReduceLROnPlateau,EarlyStopping,ModelCheckpoint
 import random
 import keras
+import myCode_dataCope as md
 import evaluation as eva
 
+md.chinese()
 seed_value = 42
 np.random.seed(seed_value)
 random.seed(seed_value)
@@ -18,19 +20,19 @@ x,y = np.load('D:\x_data.npy',allow_pickle=True),\
 train_x,train_y = x, y
 
 in_fea_num = train_x.shape[2]
-in_seq_num = train_x.shape[1]
+in_seq_len = train_x.shape[1]
 ou_fea_num = train_y.shape[2]
 ou_seq_len = train_y.shape[1]
 fine_feature_num = 4
 medium_feature_num = 9
 coarse_feature_num = 18
 hid_fea_num = 16
-k = int(in_seq_num/4)
-L_med = int(in_seq_num/2)
+k = int(in_seq_len/4)
+L_med = int(in_seq_len/2)
 
 def model():
 #-----------------------MSM---------------------------
-    l1_in = Input(shape=(in_seq_num,in_fea_num))
+    l1_in = Input(shape=(in_seq_len,in_fea_num))
     x = l1_in
     x_f = x[:,:,0:fine_feature_num]
     x_m = x[:,:,fine_feature_num:fine_feature_num + medium_feature_num]
@@ -55,7 +57,7 @@ def model():
 
     F_enhanced = F_fused + 0.1*(tf.reduce_max(F_concat,axis=3)-tf.reduce_min(F_concat,axis=3))
 # -----------------------SRG---------------------------
-    F_ctx = F_enhanced[:,max(0,L_med-k):min(L_med+k+1,in_seq_num),:]
+    F_ctx = F_enhanced[:,max(0,L_med-k):min(L_med+k+1,in_seq_len),:]
     F_target = F_enhanced[:,L_med,:]
     F_target = F_target[:,tf.newaxis,:]
     Q = Dense(units=hid_fea_num)(F_target)
