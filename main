@@ -1,0 +1,161 @@
+import math
+import tensorflow as tf
+import gc
+import numpy as np
+from keras.models import Model
+from keras.layers import Dense,Input,Conv1D,Softmax,Dot
+from keras.callbacks import ReduceLROnPlateau,EarlyStopping,ModelCheckpoint
+import random
+import keras
+import evaluation as eva
+
+seed_value = 42
+np.random.seed(seed_value)
+random.seed(seed_value)
+
+x,y = np.load('D:\x_data.npy',allow_pickle=True),\
+      np.load('D:\y_data.npy',allow_pickle=True)
+train_x,train_y = x, y
+
+in_fea_num = train_x.shape[2]
+in_seq_num = train_x.shape[1]
+ou_fea_num = train_y.shape[2]
+ou_seq_len = train_y.shape[1]
+fine_feature_num = 4
+medium_feature_num = 9
+coarse_feature_num = 18
+hid_fea_num = 16
+k = int(in_seq_num/4)
+L_med = int(in_seq_num/2)
+
+def model():
+#-----------------------MSM---------------------------
+    l1_in = Input(shape=(in_seq_num,in_fea_num))
+    x = l1_in
+    x_f = x[:,:,0:fine_feature_num]
+    x_m = x[:,:,fine_feature_num:fine_feature_num + medium_feature_num]
+    x_c = x[:,:,fine_feature_num+medium_feature_num:in_fea_num]
+    x_f2 = Conv1D(filters=fine_feature_num,kernel_size=3,strides=1,padding='same')(x_f)
+    F_f = Conv1D(filters=fine_feature_num,kernel_size=2,strides=1,padding='same')(x_f2)+x_f
+    F_f = Dense(units=fine_feature_num)(F_f)[:,:,:,tf.newaxis]
+    x_m2 = Conv1D(filters=medium_feature_num, kernel_size=7, strides=1, padding='same')(x_m)
+    F_m = Conv1D(filters=medium_feature_num, kernel_size=5, strides=1, padding='same')(x_m2)+x_m
+    F_m = Dense(units=medium_feature_num)(F_m)[:,:,:,tf.newaxis]
+    x_c2 = Conv1D(filters=coarse_feature_num, kernel_size=15, strides=1, padding='same')(x_c)
+    F_c = Conv1D(filters=coarse_feature_num, kernel_size=11, strides=1, padding='same')(x_c2)+x_c
+    F_c = Dense(units=coarse_feature_num)(F_c)[:,:,:,tf.newaxis]
+
+    F_concat = tf.concat([F_f,F_m,F_c], axis=3)
+    GlobalAvg = tf.reduce_mean(F_concat, axis=1)
+    GlobalMax = tf.reduce_max(F_concat, axis=1)
+    GlobalStat = tf.concat([GlobalAvg,GlobalMax], axis=2)
+    w = Softmax()(Dense(units=3)(GlobalStat))
+    F_fused = tf.multiply(F_concat, w[:, tf.newaxis, :, :])
+    F_fused = tf.reduce_sum(F_fused, axis=3)
+
+    F_enhanced = F_fused + 0.1*(tf.reduce_max(F_concat,axis=3)-tf.reduce_min(F_concat,axis=3))
+# -----------------------SRG---------------------------
+    F_ctx = F_enhanced[:,max(0,L_med-k):min(L_med+k+1,in_seq_num),:]
+    F_target = F_enhanced[:,L_med,:]
+    F_target = F_target[:,tf.newaxis,:]
+    Q = Dense(units=hid_fea_num)(F_target)
+    K = Dense(units=hid_fea_num)(F_ctx)
+    V = Dense(units=hid_fea_num)(F_ctx)
+
+    F_fusion = Dot(axes=(2,1))([Q,tf.transpose(K,[0,2,1])])/int(math.sqrt(hid_fea_num))
+    F_fusion = Dot(axes=(2,1))([Softmax()(F_fusion),V])
+
+    F_temp = Dense(units=hid_fea_num)(Dense(units=hid_fea_num)(F_fusion))
+    mu = tf.reduce_mean(F_fusion,2)
+    sigma = tf.reduce_mean(tf.square(F_temp - mu[:, :, tf.newaxis]), axis=2)
+    mu = mu[:,tf.newaxis,:]
+    sigma = sigma[:,tf.newaxis,:]
+    pos_encodings = tf.constant([
+        [0, 0, 0],[1, 0, 0],[0, 1, 0],
+        [1, 1, 0],[0, 0, 1],[1, 0, 1],
+        [0, 1, 1],[1, 1, 1]
+    ], dtype=tf.float32)
+
+    dense_layers = [Dense(units=ou_fea_num) for _ in range(ou_seq_len)]
+    outputs = []
+    for i in range(ou_seq_len):
+        pos_encoding = pos_encodings[i]
+        pos_encoding = pos_encoding[tf.newaxis, tf.newaxis, :]
+        batch_size = tf.shape(mu)[0]
+        pos_encoding = tf.tile(pos_encoding, [batch_size, 1, 1])
+        concat_tensor = tf.concat([F_fusion, mu, sigma, pos_encoding], axis=2)
+        output = tf.abs(dense_layers[i](concat_tensor))
+        outputs.append(output)
+    y = tf.concat(outputs, axis=1)
+    l1_out = y
+    model = Model(l1_in, l1_out, name='model')
+    return model
+
+def focal_loss(y_true, y_pred, gamma=2.0):
+    error = y_true - y_pred
+    abs_error = tf.abs(error)
+    exp_term = tf.exp(-abs_error)
+    focal_weight = tf.pow(1.0 - exp_term, gamma)
+    focal_loss = focal_weight * tf.square(error)
+    return tf.reduce_mean(focal_loss)
+
+def ssim_loss(y_true, y_pred):
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    mu_y = tf.reduce_mean(y_true, axis=[1, 2], keepdims=True)
+    mu_yhat = tf.reduce_mean(y_pred, axis=[1, 2], keepdims=True)
+    sigma_y = tf.reduce_mean(tf.square(y_true - mu_y), axis=[1, 2], keepdims=True)
+    sigma_yhat = tf.reduce_mean(tf.square(y_pred - mu_yhat), axis=[1, 2], keepdims=True)
+    sigma_cross = tf.reduce_mean((y_true - mu_y) * (y_pred - mu_yhat), axis=[1, 2], keepdims=True)
+    numerator = (2 * mu_y * mu_yhat + C1) * (2 * sigma_cross + C2)
+    denominator = (mu_y**2 + mu_yhat**2 + C1) * (sigma_y + sigma_yhat + C2)
+    ssim = numerator / (denominator + 1e-8)
+    return 1 - tf.reduce_mean(ssim)
+
+def combined_loss(y_true, y_pred, w_ssim=0.1, gamma=2.0):
+    l_focal = focal_loss(y_true, y_pred, gamma=gamma)
+    l_ssim = ssim_loss(y_true, y_pred)
+    return l_focal + w_ssim * l_ssim
+
+model = model()
+optimizer = keras.optimizers.Adam(learning_rate=0.005,clipnorm=1)
+model.compile(loss=lambda y_true, y_pred: combined_loss(y_true, y_pred),
+              optimizer=optimizer)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=15,cooldown=5)
+early_stopping = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
+check_point = ModelCheckpoint('D:\model.h5',monitor='val_loss',save_best_only=True,verbose=1)
+callbacks = [reduce_lr, early_stopping, check_point]
+
+epochs = 200
+val_split_ratio = 0.2
+for epoch in range(epochs):
+    print(f"\nEpoch {epoch + 1}/{epochs}")
+    random_indices = np.random.permutation(train_x.shape[0])
+    val_size = int(train_x.shape[0] * val_split_ratio)
+    train_indices = random_indices[val_size:]
+    val_indices = random_indices[:val_size]
+    epoch_history = model.fit(
+        train_x[train_indices], train_y[train_indices],
+        validation_data=(train_x[val_indices], train_y[val_indices]),
+        epochs=1,
+        batch_size=128,
+        callbacks=callbacks,
+        verbose=1,
+        shuffle=True
+    )
+    del epoch_history
+    gc.collect()
+
+model = keras.models.load_model(
+        'D:\model.h5',
+        custom_objects={
+            '<lambda>': lambda y_true, y_pred: combined_loss(y_true, y_pred)
+        }
+    )
+pre = model.predict(train_x)
+y_pre=pre.reshape(-1,ou_fea_num)
+y_true=train_y.reshape(-1,ou_fea_num)
+
+metrics = eva.calculate_metrics(y_true, y_pre)
+for metric_name, value in metrics.items():
+    print(f"{metric_name}: {value:.4f}")
