@@ -1,0 +1,79 @@
+import numpy as np
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from scipy.stats import pearsonr, ks_2samp
+
+def calculate_metrics(y_true, y_pred):
+    n_samples, n_curves = y_true.shape
+    metrics = {}
+    mse_list, rmse_list, mae_list, mape_list = [], [], [], []
+
+    for i in range(n_curves):
+        mse = mean_squared_error(y_true[:, i], y_pred[:, i])
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_true[:, i], y_pred[:, i])
+
+        mask = y_true[:, i] != 0
+        if np.any(mask):
+            mape = np.mean(np.abs((y_true[mask, i] - y_pred[mask, i]) / y_true[mask, i])) * 100
+        else:
+            mape = np.nan
+
+        mse_list.append(mse)
+        rmse_list.append(rmse)
+        mae_list.append(mae)
+        mape_list.append(mape)
+
+    metrics['MSE'] = np.mean(mse_list)
+    metrics['RMSE'] = np.mean(rmse_list)
+    metrics['MAE'] = np.mean(mae_list)
+    metrics['MAPE'] = np.nanmean(mape_list)
+
+    r2_list, pearson_list, ccc_list = [], [], []
+    for i in range(n_curves):
+        r2 = r2_score(y_true[:, i], y_pred[:, i])
+        corr, _ = pearsonr(y_true[:, i], y_pred[:, i])
+        mean_true = np.mean(y_true[:, i])
+        mean_pred = np.mean(y_pred[:, i])
+        var_true = np.var(y_true[:, i])
+        var_pred = np.var(y_pred[:, i])
+        covar = np.cov(y_true[:, i], y_pred[:, i])[0, 1]
+        ccc = (2 * covar) / (var_true + var_pred + (mean_true - mean_pred) ** 2)
+        r2_list.append(r2)
+        pearson_list.append(corr)
+        ccc_list.append(ccc)
+
+    metrics['R²'] = np.mean(r2_list)
+    metrics['Pearson'] = np.mean(pearson_list)
+    metrics['CCC'] = np.mean(ccc_list)
+
+    ks_list = []
+    for i in range(n_curves):
+        _, p_value = ks_2samp(y_true[:, i], y_pred[:, i])
+        ks_list.append(p_value)
+
+    metrics['K-S_p'] = np.mean(ks_list)
+
+    mase_list = []
+    for i in range(n_curves):
+        naive_pred = y_true[:-1, i]
+        naive_mae = mean_absolute_error(y_true[1:, i], naive_pred)
+        current_mae = mean_absolute_error(y_true[:, i], y_pred[:, i])
+        if naive_mae != 0:
+            mase = current_mae / naive_mae
+        else:
+            mase = np.nan
+        mase_list.append(mase)
+    metrics['MASE'] = np.nanmean(mase_list)
+
+    smape_list = []
+    for i in range(n_curves):
+        denominator = np.abs(y_true[:, i]) + np.abs(y_pred[:, i])
+        mask = denominator != 0
+        if np.any(mask):
+            smape = 200 * np.mean(np.abs(y_true[mask, i] - y_pred[mask, i]) / denominator[mask])
+        else:
+            smape = 0
+        smape_list.append(smape)
+    metrics['SMAPE'] = np.mean(smape_list)
+    return metrics
+
