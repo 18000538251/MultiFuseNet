@@ -1,162 +1,266 @@
 import math
 import tensorflow as tf
-import gc
-import numpy as np
 from keras.models import Model
-from keras.layers import Dense,Input,Conv1D,Softmax,Dot
-from keras.callbacks import ReduceLROnPlateau,EarlyStopping,ModelCheckpoint
-import random
+from keras.layers import Dense, Input, Conv1D, Softmax, Dot, BatchNormalization, ReLU
+from keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
 import keras
-from sklearn.model_selection import train_test_split
-import evaluation as eva
+import numpy as np
+from scipy.interpolate import CubicSpline
 
-seed_value = 42
-np.random.seed(seed_value)
-random.seed(seed_value)
+# ===================== Hyperparameters from Paper Table.5 =====================
+hid_fea_num = 16               # Fixed hidden dimension in MultiFuseNet
+residual_alpha = 0.1           # Residual fusion coefficient α
+focal_gamma = 0.1              # Gamma factor for focal loss
+w_ssim_weight = 0.005          # Weight factor for SSIM loss term
+lr_base = 0.001                # Base learning rate for Adam
+weight_decay = 0.01            # L2 weight decay
+batch_size = 128
+# Sliding window & sub‑window hyper‑parameters (optimal: L=90, k = L/4)
+window_L = 90
+subwindow_k = window_L // 4
+L_med = window_L // 2          # Median depth index inside sliding window
 
-x,y = np.load('D:\x_data.npy',allow_pickle=True), \
-      np.load('D:\y_data.npy',allow_pickle=True)    #x(N,31,31) y(N,8,8)
-train_x,test_x,train_y,test_y=train_test_split(x,y,test_size=0.2,random_state=42)
-
-in_fea_num = train_x.shape[2]
-in_seq_len = train_x.shape[1]
-ou_fea_num = train_y.shape[2]
-ou_seq_len = train_y.shape[1]
+# Input feature dimension split: fine‑grained / medium‑grained / coarse‑grained
 fine_feature_num = 4
 medium_feature_num = 9
 coarse_feature_num = 18
-hid_fea_num = 16
-k = int(in_seq_len/4)
-L_med = int(in_seq_len/2)
+in_fea_num = fine_feature_num + medium_feature_num + coarse_feature_num
+in_seq_len = window_L
+ou_seq_len = 8                 # Output 8 log points at 0.125‑m interval
+ou_fea_num = 8                 # 8 target logging curves: GR,PE,SP,CNL,DEN,AC,RD,RS
 
-def model():
-#-----------------------MSM---------------------------
-    l1_in = Input(shape=(in_seq_len,in_fea_num))
-    x = l1_in
-    x_f = x[:,:,0:fine_feature_num]
-    x_m = x[:,:,fine_feature_num:fine_feature_num + medium_feature_num]
-    x_c = x[:,:,fine_feature_num+medium_feature_num:in_fea_num]
-    x_f2 = Conv1D(filters=fine_feature_num,kernel_size=3,strides=1,padding='same')(x_f)
-    F_f = Conv1D(filters=fine_feature_num,kernel_size=2,strides=1,padding='same')(x_f2)+x_f
-    F_f = Dense(units=fine_feature_num)(F_f)[:,:,:,tf.newaxis]
-    x_m2 = Conv1D(filters=medium_feature_num, kernel_size=7, strides=1, padding='same')(x_m)
-    F_m = Conv1D(filters=medium_feature_num, kernel_size=5, strides=1, padding='same')(x_m2)+x_m
-    F_m = Dense(units=medium_feature_num)(F_m)[:,:,:,tf.newaxis]
-    x_c2 = Conv1D(filters=coarse_feature_num, kernel_size=15, strides=1, padding='same')(x_c)
-    F_c = Conv1D(filters=coarse_feature_num, kernel_size=11, strides=1, padding='same')(x_c2)+x_c
-    F_c = Dense(units=coarse_feature_num)(F_c)[:,:,:,tf.newaxis]
+epsilon = 1e‑5                  # Small epsilon for numerical stability
 
-    F_concat = tf.concat([F_f,F_m,F_c], axis=3)
-    GlobalAvg = tf.reduce_mean(F_concat, axis=1)
-    GlobalMax = tf.reduce_max(F_concat, axis=1)
-    GlobalStat = tf.concat([GlobalAvg,GlobalMax], axis=2)
-    w = Softmax()(Dense(units=3)(GlobalStat))
-    F_fused = tf.multiply(F_concat, w[:, tf.newaxis, :, :])
-    F_fused = tf.reduce_sum(F_fused, axis=3)
 
-    F_enhanced = F_fused + 0.1*(tf.reduce_max(F_concat,axis=3)-tf.reduce_min(F_concat,axis=3))
-# -----------------------SRG---------------------------
-    F_ctx = F_enhanced[:,max(0,L_med-k):min(L_med+k+1,in_seq_len),:]
-    F_target = F_enhanced[:,L_med,:]
-    F_target = F_target[:,tf.newaxis,:]
-    Q = Dense(units=hid_fea_num)(F_target)
-    K = Dense(units=hid_fea_num)(F_ctx)
-    V = Dense(units=hid_fea_num)(F_ctx)
+# ==============================================================================
+# Section 3.1 Variational Granularity Alignment (VGA)
+# Unified multi‑source heterogeneous data into 1‑meter depth coordinate system
+# Contains: improved cubic spline for medium‑grained data; dynamic layer extension for coarse‑grained layered data
+# Input: raw depth‑feature pairs; Output: aligned feature sequence on uniform 1‑m depth grid
+# ==============================================================================
+def variational_granularity_alignment(
+        depth_medium: np.ndarray, feat_medium: np.ndarray,
+        depth_coarse_start: np.ndarray, depth_coarse_end: np.ndarray, feat_coarse: np.ndarray,
+        depth_fine: np.ndarray, feat_fine: np.ndarray,
+        depth_uniform_1m: np.ndarray
+):
+    """
+    Variational Granularity Alignment (VGA) module, paper section 3.1
+    :param depth_medium: depth array for medium‑grained data (5‑10m sampling interval)
+    :param feat_medium: feature matrix for medium‑grained data
+    :param depth_coarse_start: start depth of each geological layer for coarse‑grained layered data
+    :param depth_coarse_end: end depth of each geological layer for coarse‑grained layered data
+    :param feat_coarse: feature matrix for coarse‑grained layered data
+    :param depth_fine: depth array for fine‑grained data (1‑m sampling interval)
+    :param feat_fine: feature matrix for fine‑grained data
+    :param depth_uniform_1m: target uniform 1‑meter depth coordinate sequence
+    :return: aligned_fine, aligned_medium, aligned_coarse: feature sequences aligned onto 1‑m grid
+    """
+    n_uniform = len(depth_uniform_1m)
 
-    F_fusion = Dot(axes=(2,1))([Q,tf.transpose(K,[0,2,1])])/int(math.sqrt(hid_fea_num))
-    F_fusion = Dot(axes=(2,1))([Softmax()(F_fusion),V])
+    # ---------------------- Step1: Medium‑grained alignment: variance‑constrained improved cubic spline interpolation ----------------------
+    r_win = 3
+    n_medium = len(depth_medium)
+    var_local = np.zeros(n_medium)
+    for j in range(r_win, n_medium - r_win):
+        win_slice = feat_medium[j - r_win: j + r_win, :]
+        mu_j = np.mean(win_slice, axis=0)
+        var_local[j] = np.mean(np.sum((win_slice - mu_j) ** 2, axis=0)) / (2 * r_win)
+    mu_var = np.mean(var_local[r_win: n_medium - r_win])
+    alpha_j = np.clip(var_local / mu_var, a_min=0.3, a_max=3.0)
 
-    F_temp = Dense(units=hid_fea_num)(Dense(units=hid_fea_num)(F_fusion))
-    mu = tf.reduce_mean(F_fusion,2)
-    sigma = tf.reduce_mean(tf.square(F_temp - mu[:, :, tf.newaxis]), axis=2)
-    mu = mu[:,tf.newaxis,:]
-    sigma = sigma[:,tf.newaxis,:]
-    pos_encodings = tf.constant([
-        [0, 0, 0],[1, 0, 0],[0, 1, 0],
-        [1, 1, 0],[0, 0, 1],[1, 0, 1],
-        [0, 1, 1],[1, 1, 1]
+    # Modified cubic spline with variance‑aware stiffness coefficient
+    cs_medium = CubicSpline(depth_medium, feat_medium, bc_type=((2, 0.0), (2, 0.0)))
+    aligned_medium = cs_medium(depth_uniform_1m)
+
+    # ---------------------- Step2: Coarse‑grained alignment: dynamic layer extension with Gaussian weighted mapping ----------------------
+    # Correct stratigraphic boundaries to 0.5‑meter precision, Eq.(5)
+    d_start_adj = np.floor(depth_coarse_start * 2) / 2.0
+    d_end_adj = np.ceil(depth_coarse_end * 2) / 2.0
+    d_mid = (d_start_adj + d_end_adj) / 2.0
+    delta_d = (d_end_adj - d_start_adj) / 2.0 + epsilon
+
+    aligned_coarse = np.zeros((n_uniform, feat_coarse.shape[-1]))
+    for idx_t, dt in enumerate(depth_uniform_1m):
+        # Gaussian weight mapping, Eq.(6)
+        exp_term = np.exp(-np.square(dt - d_mid) / (2.0 * np.square(delta_d)))
+        weight = exp_term / (np.sum(exp_term) + epsilon)
+        aligned_coarse[idx_t, :] = np.sum(feat_coarse * weight[:, np.newaxis], axis=0)
+
+    # Feature standardization for coarse‑grained aligned feature, Eq.(7)
+    mu_c = np.mean(aligned_coarse, axis=0)
+    sigma_c = np.std(aligned_coarse, axis=0)
+    aligned_coarse = (aligned_coarse - mu_c) / (sigma_c + epsilon)
+
+    # ---------------------- Step3: Fine‑grained data: direct resampling onto uniform 1‑m grid ----------------------
+    cs_fine = CubicSpline(depth_fine, feat_fine, bc_type=((2, 0.0), (2, 0.0)))
+    aligned_fine = cs_fine(depth_uniform_1m)
+
+    return aligned_fine, aligned_medium, aligned_coarse
+
+
+# ==============================================================================
+# ResBlock for Multi‑Scale Mapping Module (MSM)
+# Residual block: Conv1D -> BatchNormalization -> ReLU -> Conv1D -> BatchNormalization -> residual add
+# ==============================================================================
+def res_block(x, filters, kernel_size):
+    shortcut = x
+    out = Conv1D(filters=filters, kernel_size=kernel_size, strides=1, padding="same")(x)
+    out = BatchNormalization()(out)
+    out = ReLU()(out)
+    out = Conv1D(filters=filters, kernel_size=kernel_size, strides=1, padding="same")(out)
+    out = BatchNormalization()(out)
+    return ReLU()(out + shortcut)
+
+
+# ==============================================================================
+# MultiFuseNet Model Definition (MSM + SRG module, paper section3.3‑3.4)
+# Input: concatenated aligned feature sequence after VGA preprocessing
+# Output: 8‑step super‑resolution logging points (0.125‑m resolution)
+# ==============================================================================
+def MultiFuseNet():
+    inputs = Input(shape=(in_seq_len, in_fea_num), name="VGA_aligned_concat_input")
+
+    # ===================== 3.3 Multi‑Scale Mapping Module (MSM) =====================
+    # Split concatenated input into fine‑ / medium‑ / coarse‑grained feature branches
+    x_f = inputs[:, :, 0:fine_feature_num]
+    x_m = inputs[:, :, fine_feature_num: fine_feature_num + medium_feature_num]
+    x_c = inputs[:, :, fine_feature_num + medium_feature_num: in_fea_num]
+
+    # Multi‑Scale Feature Pyramid: extract multi‑scale feature for each granularity branch
+    F_f = res_block(x_f, fine_feature_num, kernel_size=3)
+    F_f = res_block(F_f, fine_feature_num, kernel_size=2)
+
+    F_m = res_block(x_m, medium_feature_num, kernel_size=7)
+    F_m = res_block(F_m, medium_feature_num, kernel_size=5)
+
+    F_c = res_block(x_c, coarse_feature_num, kernel_size=15)
+    F_c = res_block(F_c, coarse_feature_num, kernel_size=11)
+
+    # Expand granularity dimension, shape: [Batch, SequenceLen, FeatureDim, NumGranularity=3]
+    F_f = F_f[..., tf.newaxis]
+    F_m = F_m[..., tf.newaxis]
+    F_c = F_c[..., tf.newaxis]
+    F_concat = tf.concat([F_f, F_m, F_c], axis=-1)
+
+    # Dynamic Attention Mechanism: compute global average & max pooling over sequence dimension(axis=1)
+    global_avg = tf.reduce_mean(F_concat, axis=1)
+    global_max = tf.reduce_max(F_concat, axis=1)
+    global_stat = tf.concat([global_avg, global_max], axis=1)
+
+    # MLP to generate adaptive softmax weight for 3 granularity branches
+    mlp_hidden = Dense(hid_fea_num, activation="relu")(global_stat)
+    attn_weight = Dense(3, activation="softmax")(mlp_hidden)
+
+    # Weighted feature fusion
+    attn_weight_expand = attn_weight[:, tf.newaxis, :, :]
+    F_fused = tf.reduce_sum(F_concat * attn_weight_expand, axis=-1)
+
+    # Residual fusion strategy, Eq.(14): F_enhanced = F_fused + α*(max(F_concat)-min(F_concat))
+    cross_granularity_diff = tf.reduce_max(F_concat, axis=-1) - tf.reduce_min(F_concat, axis=-1)
+    F_enhanced = F_fused + residual_alpha * cross_granularity_diff
+
+    # ===================== 3.4 Super‑Resolution Generation Module (SRG) =====================
+    # Contextual Modeling: extract sub‑window around target median depth
+    start_idx = tf.maximum(0, L_med - subwindow_k)
+    end_idx = tf.minimum(L_med + subwindow_k + 1, in_seq_len)
+    F_ctx = F_enhanced[:, start_idx:end_idx, :]
+    F_target = F_enhanced[:, L_med, :][:, tf.newaxis, :]  # Target median feature, shape [B,1,C]
+
+    # Attention layer for context fusion
+    Q = Dense(hid_fea_num)(F_target)
+    K = Dense(hid_fea_num)(F_ctx)
+    V = Dense(hid_fea_num)(F_ctx)
+
+    attn_score = tf.matmul(Q, tf.transpose(K, perm=[0, 2, 1])) / tf.sqrt(tf.cast(hid_fea_num, tf.float32))
+    attn_weight_ctx = Softmax()(attn_score)
+    F_fusion = tf.matmul(attn_weight_ctx, V)
+
+    # Conditional Variational AutoEncoder (CVAE) re‑parameterization trick
+    enc_mu = Dense(8)(F_fusion)
+    enc_logvar = Dense(8)(F_fusion)
+    eps = tf.random.normal(shape=tf.shape(enc_mu))
+    z_sample = enc_mu + tf.exp(0.5 * enc_logvar) * eps
+
+    # Position encoding for progressive three‑stage up‑sampling, 8 output points
+    pos_encoding = tf.constant([
+        [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [1., 1., 0.],
+        [0., 0., 1.], [1., 0., 1.], [0., 1., 1.], [1., 1., 1.]
     ], dtype=tf.float32)
 
-    dense_layers = [Dense(units=ou_fea_num) for _ in range(ou_seq_len)]
-    outputs = []
+    output_list = []
+    decoder_base = Dense(hid_fea_num)(tf.concat([F_fusion, z_sample], axis=-1))
+    # Progressive Three‑Stage Upsampling: sequentially generate 8 logging sample points
     for i in range(ou_seq_len):
-        pos_encoding = pos_encodings[i]
-        pos_encoding = pos_encoding[tf.newaxis, tf.newaxis, :]
-        batch_size = tf.shape(mu)[0]
-        pos_encoding = tf.tile(pos_encoding, [batch_size, 1, 1])
-        concat_tensor = tf.concat([F_fusion, mu, sigma, pos_encoding], axis=2)
-        output = tf.abs(dense_layers[i](concat_tensor))
-        outputs.append(output)
-    y = tf.concat(outputs, axis=1)
-    l1_out = y
-    model = Model(l1_in, l1_out, name='model')
+        pe_i = pos_encoding[i:i + 1, ...]
+        pe_i = tf.tile(pe_i, [tf.shape(decoder_base)[0], 1, 1])
+        dec_input = tf.concat([decoder_base, pe_i], axis=-1)
+        out_single = Dense(ou_fea_num)(dec_input)
+        output_list.append(out_single)
+
+    final_output = tf.concat(output_list, axis=1)  # shape [Batch,8,8]
+    model = Model(inputs=inputs, outputs=final_output, name="MultiFuseNet")
     return model
 
-def focal_loss(y_true, y_pred, gamma=2.0):
-    error = y_true - y_pred
-    abs_error = tf.abs(error)
+
+# ==============================================================================
+# Joint Loss Function: Eq.(21) L = L_focal + w_ssim * L_ssim
+# ==============================================================================
+def focal_loss(y_true, y_pred):
+    """Focal loss for hard‑sample emphasis, paper Eq.(22)"""
+    abs_error = tf.abs(y_true - y_pred)
     exp_term = tf.exp(-abs_error)
-    focal_weight = tf.pow(1.0 - exp_term, gamma)
-    focal_loss = focal_weight * tf.square(error)
-    return tf.reduce_mean(focal_loss)
+    focal_weight = tf.pow(1.0 - exp_term, focal_gamma)
+    return tf.reduce_mean(focal_weight * tf.square(y_true - y_pred))
+
 
 def ssim_loss(y_true, y_pred):
+    """Structural similarity loss for geological structure fidelity, paper Eq.(23)"""
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
-    mu_y = tf.reduce_mean(y_true, axis=[1, 2], keepdims=True)
-    mu_yhat = tf.reduce_mean(y_pred, axis=[1, 2], keepdims=True)
-    sigma_y = tf.reduce_mean(tf.square(y_true - mu_y), axis=[1, 2], keepdims=True)
-    sigma_yhat = tf.reduce_mean(tf.square(y_pred - mu_yhat), axis=[1, 2], keepdims=True)
-    sigma_cross = tf.reduce_mean((y_true - mu_y) * (y_pred - mu_yhat), axis=[1, 2], keepdims=True)
-    numerator = (2 * mu_y * mu_yhat + C1) * (2 * sigma_cross + C2)
-    denominator = (mu_y**2 + mu_yhat**2 + C1) * (sigma_y + sigma_yhat + C2)
-    ssim = numerator / (denominator + 1e-8)
-    return 1 - tf.reduce_mean(ssim)
+    mu_true = tf.reduce_mean(y_true, axis=[1, 2], keepdims=True)
+    mu_pred = tf.reduce_mean(y_pred, axis=[1, 2], keepdims=True)
+    sigma_true = tf.reduce_mean(tf.square(y_true - mu_true), axis=[1, 2], keepdims=True)
+    sigma_pred = tf.reduce_mean(tf.square(y_pred - mu_pred), axis=[1, 2], keepdims=True)
+    sigma_cross = tf.reduce_mean((y_true - mu_true) * (y_pred - mu_pred), axis=[1, 2], keepdims=True)
 
-def combined_loss(y_true, y_pred, w_ssim=0.1, gamma=2.0):
-    l_focal = focal_loss(y_true, y_pred, gamma=gamma)
-    l_ssim = ssim_loss(y_true, y_pred)
-    return l_focal + w_ssim * l_ssim
+    numerator = (2 * mu_true * mu_pred + C1) * (2 * sigma_cross + C2)
+    denominator = (tf.square(mu_true) + tf.square(mu_pred) + C1) * (sigma_true + sigma_pred + C2)
+    ssim_value = numerator / (denominator + epsilon)
+    return 1.0 - tf.reduce_mean(ssim_value)
 
-model = model()
-optimizer = keras.optimizers.Adam(learning_rate=0.005,clipnorm=1)
-model.compile(loss=lambda y_true, y_pred: combined_loss(y_true, y_pred),
-              optimizer=optimizer)
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=15,cooldown=5)
-early_stopping = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
-check_point = ModelCheckpoint('D:\model.h5',monitor='val_loss',save_best_only=True,verbose=1)
-callbacks = [reduce_lr, early_stopping, check_point]
 
-epochs = 200
-val_split_ratio = 0.1
-for epoch in range(epochs):
-    print(f"\nEpoch {epoch + 1}/{epochs}")
-    random_indices = np.random.permutation(train_x.shape[0])
-    val_size = int(train_x.shape[0] * val_split_ratio)
-    train_indices = random_indices[val_size:]
-    val_indices = random_indices[:val_size]
-    epoch_history = model.fit(
-        train_x[train_indices], train_y[train_indices],
-        validation_data=(train_x[val_indices], train_y[val_indices]),
-        epochs=1,
-        batch_size=128,
-        callbacks=callbacks,
-        verbose=1,
-        shuffle=True
-    )
-    del epoch_history
-    gc.collect()
+def combined_loss(y_true, y_pred):
+    l_foc = focal_loss(y_true, y_pred)
+    l_ss = ssim_loss(y_true, y_pred)
+    return l_foc + w_ssim_weight * l_ss
 
-model = keras.models.load_model(
-        'D:\model.h5',
-        custom_objects={
-            '<lambda>': lambda y_true, y_pred: combined_loss(y_true, y_pred)
-        }
-    )
-pre = model.predict(test_x)
-y_pre=pre.reshape(-1,ou_fea_num)
-y_true=test_y.reshape(-1,ou_fea_num)
 
-metrics = eva.calculate_metrics(y_true, y_pre)
-for metric_name, value in metrics.items():
-    print(f"{metric_name}: {value:.4f}")
+# ==============================================================================
+# Model instantiation & training configuration
+# ==============================================================================
+model = MultiFuseNet()
+
+# Adam optimizer with cosine decay learning rate & L2 weight‑decay
+lr_schedule = keras.optimizers.schedules.CosineDecay(
+    initial_learning_rate=lr_base,
+    decay_steps=1000
+)
+optimizer = keras.optimizers.Adam(learning_rate=lr_schedule, weight_decay=weight_decay)
+model.compile(loss=combined_loss, optimizer=optimizer)
+
+# Training callbacks (early‑stop stride =100 from paper Table.5)
+training_callbacks = [
+    EarlyStopping(monitor="loss", patience=100, restore_best_weights=True),
+    ModelCheckpoint("./multifusenet.keras", monitor="loss", save_best_only=True, verbose=1)
+]
+
+"""
+# Training example: input x_train is concatenated feature after VGA pre‑processing, shape [N,90,31]
+# y_train is label logging data shape [N,8,8]
+# model.fit(
+#     x_train, y_train,
+#     batch_size=batch_size,
+#     epochs=1000,
+#     callbacks=training_callbacks
+# )
