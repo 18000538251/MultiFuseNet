@@ -27,7 +27,7 @@ model.fit(x_train, y_train, batch_size=128, epochs=1000, callbacks=training_call
 model = keras.models.load_model("multifusenet.keras", custom_objects={"combined_loss":combined_loss})
 y_pred = model.predict(x_test)
 
-## Hyper‑parameters (From Paper Table5)
+## Hyper‑parameters 
 Parameter             Value
 Optimizer             Adam
 Max epochs            1000
